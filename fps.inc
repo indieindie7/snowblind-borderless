@@ -54,7 +54,7 @@ static void unmute_session() {
         v->Release();
     }
 }
-static void map_poll();
+static void map_poll(); static void hud_probe(); static int g_probe_in = -1;
 static DWORD WINAPI fps_thread(LPVOID) {
     const int W = FPS_W + 8, H = FPS_H + 26;
     WNDCLASSW wc = {}; wc.lpfnWndProc = DefWindowProcW; wc.hInstance = GetModuleHandleA(nullptr); wc.lpszClassName = L"SBFps"; RegisterClassW(&wc);
@@ -72,6 +72,7 @@ static DWORD WINAPI fps_thread(LPVOID) {
     for (;;) {
         if (hud_try >= 0) { ++hud_try; if (hud_tweaks(hud_try >= 1200) || hud_try >= 1200) hud_try = -1; }  // up to 2 minutes (the menu exe is another build: no match there)
         map_poll();
+        if (g_probe_in > 0 && --g_probe_in == 0) hud_probe();
         if (++tick % 10 == 0) unmute_session();
         MSG m; while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&m);
         Sleep(100);
@@ -95,7 +96,7 @@ static DWORD WINAPI fps_thread(LPVOID) {
 // Init = vtable[1] (vtable 0xfcea18, slot 0xfcea1c = 0x53f780). Pointing the slot at a "ret 4" stub
 // (0x536320) leaves the reticle unbuilt. A file "show-reticle" in the game folder keeps it.
 // The exe is still packed when the window appears, so this is retried from the graph thread until the code is there.
-static void radar_off();
+static void radar_off(); static void ammo_move();
 static bool hud_tweaks(bool last) {
     if (GetFileAttributesA("show-reticle") != INVALID_FILE_ATTRIBUTES) { logf("reticle kept (show-reticle)"); return true; }
     __try {
@@ -111,6 +112,7 @@ static bool hud_tweaks(bool last) {
         } else logf("reticle: update guard not applied (%02x %02x %02x)", fn[0], fn[1], fn[2]);
         logf("reticle off");
         radar_off();
+        ammo_move();
     } __except (EXCEPTION_EXECUTE_HANDLER) { if (last) logf("reticle: patch failed"); return last; }
     return true;
 }
@@ -187,6 +189,7 @@ static void map_poll() {
     }
     if (GetFileAttributesA("keep-hud") != INVALID_FILE_ATTRIBUTES) off = false;
     logf("map \"%s\" (index %lu of %lu, state %lu, first \"%s\") -> HUD %s", nm, idx, cnt, rd(ms + 0x20), first, off ? "off (disabled)" : "on");
+    g_probe_in = 100;  // 10 s after the map is known: dump the ammo panel objects
     // hud_set(off) is off for now: loading a level crashed with it (user, 10-18); the HUD gets a redesign instead.
 }
 // Radar gone on every map (user, 10-18: "no more radar, radar is bad mechanics"): HUDPlayerBaseSegment init
@@ -200,4 +203,67 @@ static void radar_off() {
         if (at[0] == 0x74 && at[1] == 0x1d && hud_poke(at, &jmp, 1)) logf("radar off");
         else logf("radar: bytes %02x %02x, left alone", at[0], at[1]);
     } __except (EXCEPTION_EXECUTE_HANDLER) { logf("radar: patch failed"); }
+}
+// Probe for the HUD redesign (user, 10-18: ammo counter to the bottom-left). Positions are art markers, not config
+// (hud_re.md Round 3), so the live objects are dumped: every heap object whose vtable is the primary weapon group,
+// a hudinteger or a hudweaponicon, with its first 0x80 bytes as hex + float, and the group's children (+0x14 count, +0x1c data).
+static void hud_dump(DWORD o, const char* what) {
+    logf("probe %s @%08lx", what, o);
+    for (int off = 0; off < 0x80; off += 16) {
+        char line[200]; int n = sprintf_s(line, "  +%02x", off);
+        for (int k = 0; k < 16; k += 4) { DWORD v = rd(o + off + k); float f; memcpy(&f, &v, 4);
+            n += sprintf_s(line + n, sizeof line - n, (fabsf(f) > 1e-3f && fabsf(f) < 1e5f) ? " %08lx(%.3g)" : " %08lx", v, f); }
+        logf("%s", line);
+    }
+}
+static void hud_probe() {
+    static const struct { DWORD vt; const char* n; } V[] = {{0xfcead8, "primarygroup"}, {0xfcdc58, "hudinteger"}, {0xfcf380, "weaponicon"}};
+    int found = 0; MEMORY_BASIC_INFORMATION mi; BYTE* a = (BYTE*)0x10000;
+    while (found < 40 && VirtualQuery(a, &mi, sizeof mi) && (DWORD)a < 0x7fff0000) {
+        if (mi.State == MEM_COMMIT && mi.Type == MEM_PRIVATE && (mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) && !(mi.Protect & PAGE_GUARD)) {
+            DWORD* p = (DWORD*)mi.BaseAddress; size_t n = mi.RegionSize / 4;
+            __try {
+                for (size_t i = 0; i < n && found < 40; ++i) for (auto& v : V) if (p[i] == v.vt) {
+                    DWORD o = (DWORD)(p + i); hud_dump(o, v.n); ++found;
+                    if (v.vt == 0xfcead8) { DWORD c = rd(o + 0x14), d = rd(o + 0x1c);
+                        for (DWORD j = 0; j < c && j < 8; ++j) logf("  child %lu: %08lx %08lx (vt %08lx)", j, rd(d + j * 8), rd(d + j * 8 + 4), rd(rd(d + j * 8 + 4))); }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        a = (BYTE*)mi.BaseAddress + mi.RegionSize;
+    }
+    logf("probe: %d HUD objects", found);
+}
+// Ammo counter to the bottom-left (user, 10-18). The primary weapon group (vtable 0xfcead8, Init = slot 0xfceadc =
+// 0x53fd20, "ret 4") builds its children from art markers; each hudinteger child (vt 0xfcdc58) copies its marker to
+// +0x54 and hands it to a text renderer r = [child+0x44], which keeps its own copy at r+0x80 (used when the number
+// changes) and baked quads at [r+0x44] (count r+0x40, 24-byte verts x,y,z,colour,u,v in 0..1 screen units:
+// x = (px+320)/640, y = (240-py)/480). The wrapper runs the real Init, then shifts all three. Verified live 10-18.
+// A file "keep-ammo" leaves the counter in the top-right panel.
+static const float AMMO_DX = -470.f, AMMO_DY = -350.f;
+typedef int (__thiscall* PgInit)(void*, void*);
+static PgInit g_pg_init = (PgInit)0x53fd20;
+static void ammo_shift(DWORD c) {
+    float* p = (float*)(c + 0x54); p[0] += AMMO_DX; p[1] += AMMO_DY;
+    DWORD r = rd(c + 0x44); if (!r) return;
+    float* q = (float*)(r + 0x80); q[0] += AMMO_DX; q[1] += AMMO_DY;
+    DWORD n = rd(r + 0x40), vb = rd(r + 0x44);
+    for (DWORD i = 0; vb && i < n && i < 256; ++i) { float* v = (float*)(vb + i * 24); v[0] += AMMO_DX / 640.f; v[1] -= AMMO_DY / 480.f; }
+}
+static int __fastcall pg_init_hook(void* self, void*, void* arg) {
+    int ret = g_pg_init(self, arg);
+    __try {
+        DWORD o = (DWORD)self, c = rd(o + 0x14), d = rd(o + 0x1c), n = 0;
+        for (DWORD j = 0; j < c && j < 16; ++j) { DWORD e = rd(d + j * 8 + 4); if (e && rd(e) == 0xfcdc58) { ammo_shift(e); ++n; } }
+        static int logged = 0; if (logged++ < 3) logf("ammo: group %08lx, %lu counters moved", o, n);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { logf("ammo: shift failed"); }
+    return ret;
+}
+static void ammo_move() {
+    if (GetFileAttributesA("keep-ammo") != INVALID_FILE_ATTRIBUTES) { logf("ammo kept (keep-ammo)"); return; }
+    __try {
+        DWORD* slot = (DWORD*)0xfceadc; DWORD want = (DWORD)&pg_init_hook;
+        if (*slot == 0x53fd20 && hud_poke((BYTE*)slot, (const BYTE*)&want, 4)) logf("ammo: group Init hooked");
+        else logf("ammo: slot %08lx, left alone", *slot);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { logf("ammo: hook failed"); }
 }
