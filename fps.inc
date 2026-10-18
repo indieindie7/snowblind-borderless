@@ -95,6 +95,7 @@ static DWORD WINAPI fps_thread(LPVOID) {
 // Init = vtable[1] (vtable 0xfcea18, slot 0xfcea1c = 0x53f780). Pointing the slot at a "ret 4" stub
 // (0x536320) leaves the reticle unbuilt. A file "show-reticle" in the game folder keeps it.
 // The exe is still packed when the window appears, so this is retried from the graph thread until the code is there.
+static void radar_off();
 static bool hud_tweaks(bool last) {
     if (GetFileAttributesA("show-reticle") != INVALID_FILE_ATTRIBUTES) { logf("reticle kept (show-reticle)"); return true; }
     __try {
@@ -109,6 +110,7 @@ static bool hud_tweaks(bool last) {
             fn[0] = 0xc2; fn[1] = 0x04; fn[2] = 0x00; VirtualProtect(fn, 3, old, &old); FlushInstructionCache(GetCurrentProcess(), fn, 3);
         } else logf("reticle: update guard not applied (%02x %02x %02x)", fn[0], fn[1], fn[2]);
         logf("reticle off");
+        radar_off();
     } __except (EXCEPTION_EXECUTE_HANDLER) { if (last) logf("reticle: patch failed"); return last; }
     return true;
 }
@@ -117,46 +119,85 @@ static void fps_start() {
     CreateThread(nullptr, 0, fps_thread, nullptr, 0, nullptr);
 }
 // ---- mission-1 HUD off (user, 10-18: radar, health/ammo counters and subtitles come only from mission 2 on, lore-wise) ----
-// Same trick as the reticle: each HUD component class builds its art in Init = vtable[1]; while the current map
-// is listed in "snowblind-nohud.txt" (one map name per line; default: the first map of the mission list) the slots
-// point at the ret-4 stub, so components created on that map's load stay empty. Classes from static RE (Sonnet, hud_re.md).
+// Same trick as the reticle: each HUD component class builds its art in Init = vtable[1]; while the HUD is off the
+// slots point at the ret-4 stub, so components created on that map's load stay empty. Methods that use the unbuilt
+// art without a null test get "ret" stubs too, and the radar is never added (the game's own "hideradar" branch).
+// All from static RE (Sonnet, %TEMP%\sbdump\hud_re.md Round 2). Everything is swapped back when the HUD is on.
 struct HudSlot { DWORD slot, init; const char* name; };
 static const HudSlot g_hudslots[] = {
-    {0xfce584, 0x53bc10, "hudmeterbar"},  {0xfcd3cc, 0x52f930, "hudcirclemeter"}, {0xfcd8fc, 0x5319d0, "hudcurvedmeter"},
-    {0xfceadc, 0x53fd20, "hudprimaryweapongroup"}, {0xfcebc4, 0x5407a0, "hudsecondaryweapongroup"}, {0xfcf384, 0x547210, "hudweaponicon"},
-    {0xfcdc5c, 0x533dd0, "hudinteger"}, {0xfcf05c, 0x5450b0, "hudtextpopup"}, {0xfce84c, 0x53d270, "radar?"}};
+    {0xfce584, 0x53bc10, "hudmeterbar"}, {0xfceadc, 0x53fd20, "hudprimaryweapongroup"}, {0xfcebc4, 0x5407a0, "hudsecondaryweapongroup"},
+    {0xfcf384, 0x547210, "hudweaponicon"}, {0xfcdc5c, 0x533dd0, "hudinteger"}};
+struct HudPatch { DWORD at; BYTE exp[3]; int nexp; BYTE neu[3]; int n; BYTE save[3]; bool saved; };
+#define RET4 {0xc2, 0x04, 0x00}, 3
+#define RET0 {0xc3}, 1
+static HudPatch g_hudpatch[] = {
+    {0x53ce8d, {0x74, 0x1d}, 2, {0xeb}, 1},  // HUDPlayerBaseSegment: "if (!hideradar) AddChild(map icons)" -> always skip
+    {0x53b9e0, {0x56, 0x8b, 0xf1}, 3, RET0}, {0x53ba40, {0x56, 0x8b, 0xf1}, 3, RET0}, {0x53b370, {0x8b, 0x54, 0x24}, 3, RET4},  // meter bar
+    {0x53b3b0, {0x83, 0xec, 0x10}, 3, RET0}, {0x53b2b0, {0x83, 0xec, 0x40}, 3, RET4},
+    {0x53fc50, {0x53, 0x56, 0x8b}, 3, RET4},  // primary weapon group update
+    {0x540670, {0x6a, 0xff, 0x68}, 3, RET4}, {0x540650, {0x56, 0x8b, 0xf1}, 3, RET0},  // secondary weapon group
+    {0x533a60, {0x6a, 0xff}, 2, RET4}, {0x5339d0, {0x83, 0xec, 0x10}, 3, RET4}, {0x533890, {0x57}, 1, RET4}, {0x533950, {0x83, 0xec, 0x10}, 3, RET0}};  // integer
+static bool hud_poke(BYTE* at, const BYTE* b, int n) {
+    DWORD old; if (!VirtualProtect(at, n, PAGE_EXECUTE_READWRITE, &old)) return false;
+    memcpy(at, b, n); VirtualProtect(at, n, old, &old); FlushInstructionCache(GetCurrentProcess(), at, n); return true;
+}
 static void hud_set(bool off) {
-    int n = 0;
+    int n = 0, skip = 0;
     for (auto& s : g_hudslots) {
         __try {
             DWORD* p = (DWORD*)s.slot; DWORD want = off ? 0x536320 : s.init;
-            if (*p != s.init && *p != 0x536320) continue;  // not this build
+            if (*p != s.init && *p != 0x536320) { ++skip; continue; }  // not this build
             if (*p == want) continue;
-            DWORD old; if (VirtualProtect(p, 4, PAGE_READWRITE, &old)) { *p = want; VirtualProtect(p, 4, old, &old); ++n; }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            if (hud_poke((BYTE*)p, (const BYTE*)&want, 4)) ++n;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { ++skip; }
     }
-    if (n) logf("mission HUD %s (%d classes)", off ? "off" : "on", n);
+    for (auto& h : g_hudpatch) {
+        __try {
+            BYTE* at = (BYTE*)h.at;
+            if (off && !h.saved) {
+                if (memcmp(at, h.exp, h.nexp)) { ++skip; continue; }
+                memcpy(h.save, at, h.n); if (hud_poke(at, h.neu, h.n)) { h.saved = true; ++n; }
+            } else if (!off && h.saved && !memcmp(at, h.neu, h.n)) { if (hud_poke(at, h.save, h.n)) { h.saved = false; ++n; } }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { ++skip; }
+    }
+    if (n || skip) logf("mission HUD %s (%d changes, %d skipped)", off ? "off" : "on", n, skip);
 }
-// Current map (static RE): MissionState = *(*0x1023358) + 0x18; +0x24 map index, +0x2c WORD string id of the
-// map name; +0 map list (count at +0xc, WORD ids at +0x14). Ids resolve through the name table (name_of).
+// Current map (static RE, hud_re.md Round 2): MS = *(*(*0x1023358) + 0x18) (accessor 0x4b69a0); MS+0 map list L
+// (count at L+0xc, WORD string ids behind the pointer at L+0x14); MS+0x24 current index; MS+0x20 state (3 = loaded).
+// (MS+0x2c is LoadMap's variant/language id: it read "english".) Ids resolve through the name table.
 static bool id_str(DWORD id, char* out, int cap) {
     out[0] = 0; if (!id) return false;
     DWORD t = rd(rd(0x10332b4) + 0x4010), p = t ? rd(t + id * 8) : 0;
     return p > 0x10000 && str_at((const char*)p, out, cap);
 }
+// HUD off on the first map of the list (mission 1, lore: the radar and counters come with mission 2), or on any
+// map named in "snowblind-nohud.txt" (one per line). A file "keep-hud" keeps it everywhere.
 static void map_poll() {
-    DWORD gs = rd(rd(0x1023358)); if (!gs) return;
-    DWORD ms = gs + 0x18, idx = rd(ms + 0x24); char nm[64];
-    if (!id_str(rdw(ms + 0x2c), nm, sizeof nm)) return;
+    DWORD ms = rd(rd(rd(0x1023358)) + 0x18); if (!ms) return;
+    DWORD L = rd(ms), cnt = L ? rd(L + 0xc) : 0, idx = rd(ms + 0x24), ids = L ? rd(L + 0x14) : 0;
+    if (!ids || !cnt || cnt > 256 || idx >= cnt) return;
+    char nm[64]; if (!id_str(rdw(ids + idx * 2), nm, sizeof nm)) return;
     if (!strcmp(nm, g_map)) return;
     strcpy_s(g_map, nm);
-    DWORD list = rd(ms); char first[64] = "";
-    if (list && !id_str(rdw(list + 0x14), first, sizeof first)) id_str(rdw(rd(list + 0x14)), first, sizeof first);  // ids inline, or behind a pointer
-    bool off = false; FILE* f = nullptr;
+    char first[64] = ""; id_str(rdw(ids), first, sizeof first);
+    bool off = idx == 0; FILE* f = nullptr;
     if (!fopen_s(&f, "snowblind-nohud.txt", "r") && f) {
         char l[96]; while (fgets(l, sizeof l, f)) { l[strcspn(l, "\r\n")] = 0; if (l[0] && !_stricmp(l, nm)) off = true; }
         fclose(f);
-    }  // no default yet: the field read as "english" on mission 1 (10-18), so it is not the map name
-    logf("map \"%s\" (index %lu, first \"%s\") -> HUD %s", nm, idx, first, off ? "off" : "on");
-    hud_set(off);
+    }
+    if (GetFileAttributesA("keep-hud") != INVALID_FILE_ATTRIBUTES) off = false;
+    logf("map \"%s\" (index %lu of %lu, state %lu, first \"%s\") -> HUD %s", nm, idx, cnt, rd(ms + 0x20), first, off ? "off (disabled)" : "on");
+    // hud_set(off) is off for now: loading a level crashed with it (user, 10-18); the HUD gets a redesign instead.
+}
+// Radar gone on every map (user, 10-18: "no more radar, radar is bad mechanics"): HUDPlayerBaseSegment init
+// does "if (!hideradar) AddChild(map icons)"; the je at 0x53ce8d becomes a jmp, the game's own hideradar path.
+// A file "show-radar" keeps it.
+static void radar_off() {
+    if (GetFileAttributesA("show-radar") != INVALID_FILE_ATTRIBUTES) { logf("radar kept (show-radar)"); return; }
+    static const BYTE jmp = 0xeb;
+    __try {
+        BYTE* at = (BYTE*)0x53ce8d;
+        if (at[0] == 0x74 && at[1] == 0x1d && hud_poke(at, &jmp, 1)) logf("radar off");
+        else logf("radar: bytes %02x %02x, left alone", at[0], at[1]);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { logf("radar: patch failed"); }
 }
