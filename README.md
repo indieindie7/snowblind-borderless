@@ -31,9 +31,20 @@ Create an empty `snowblind-borderless.log` next to the exe; the proxy appends wh
   loader. Both modules import `d3d9.dll`, so the proxy in the exe folder is picked up.
 - Launching through Steam's "Play" dialog or the exe directly both work (Steam must be logged in).
 
-## No in-game sound on Windows 10/11 (menus and gameplay silent, intros have audio)
+## Sound on Windows 10/11
 
-Install [IndirectSound](https://www.indirectsound.com/) 0.20: copy its `dsound.dll` and `dsound.ini` next to `Snowblind.exe` and set `milesCompatibility = true` in `dsound.ini`. Confirmed working on Windows 11. DSOAL (the OpenAL Soft DirectSound wrapper) was not tested cleanly here; IndirectSound is the known-good option.
+**Menus silent** (intros have audio): install a DirectSound wrapper. [IndirectSound](https://www.indirectsound.com/) 0.20
+(copy its `dsound.dll` + `dsound.ini` next to `Snowblind.exe`, set `milesCompatibility = true`) or
+[DSOAL](https://github.com/kcat/dsoal) (`dsound.dll` + `dsoal-aldrv.dll`) both fix the menus.
+
+**Levels silent** (menus fine, no music or effects in gameplay): fixed by this proxy. The engine
+streams all level audio through one 11776-byte DirectSound buffer (flags `0x000140e0`), fills it
+with real samples, but only ever calls `SetVolume(-10000)` (mute) on it. The proxy hooks
+`DirectSoundCreate(8)` (via `LoadLibraryA`) -> `IDirectSound::CreateSoundBuffer` (vtable slot 3)
+-> `IDirectSoundBuffer::SetVolume` (slot 15) and keeps that one buffer at 0 dB; the in-game
+SFX/Music sliders still work because the mix already carries them. Confirmed on Windows 11 with DSOAL.
+Ruled out along the way: wrapper choice, vsync, one-core affinity, VRAM/RAM caps, speaker config,
+the `game.ini` volume letter.
 
 ## Alt-Tab and the Steam overlay
 

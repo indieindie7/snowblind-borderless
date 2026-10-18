@@ -100,11 +100,12 @@ static IatEntry g_iat[] = {
 };
 // Hot-patch the user32 exports (mov edi,edi prologue + 5 padding bytes): catches every
 // caller in the process, including the DRM-unpacked game image that has no normal IAT.
-static int hotpatch(const char* name, void* hook, void** orig) {
-    BYTE* f = (BYTE*)GetProcAddress(GetModuleHandleA("user32.dll"), name);
+static int hotpatch(const char* name, void* hook, void** orig, const char* mod = "user32.dll") {
+    BYTE* f = (BYTE*)GetProcAddress(GetModuleHandleA(mod), name);
     if (!f) { logf("%s: not found", name); return 0; }
     for (int hops = 0; hops < 4 && f[0] == 0xFF && f[1] == 0x25; ++hops) f = **(BYTE***)(f + 2);  // follow jmp [imm32] forwarders
-    if (f[0] == 0xB8) {  // win32u syscall stub: mov eax,imm32 (5 bytes, relocatable) -> trampoline hook
+    if (f[0] == 0xB8 ||  // win32u syscall stub: mov eax,imm32 (5 bytes, relocatable) -> trampoline hook
+        (f[0] == 0x55 && f[1] == 0x8B && f[2] == 0xEC && f[3] == 0x6A && f[4] == 0xFF)) {  // push ebp; mov ebp,esp; push -1 (DSOAL)
         static BYTE* pool = nullptr; static int used = 0;
         if (!pool) pool = (BYTE*)VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (!pool) return 0;
@@ -130,6 +131,80 @@ static int hotpatch(const char* name, void* hook, void** orig) {
     *orig = f + 2;
     return 1;
 }
+
+// LEVEL SOUND FIX. The built-in mixer streams level audio (music + effects) through one
+// 11776-byte DirectSound buffer (flags CTRLVOLUME|CTRLPAN|CTRLFREQUENCY|GETCURRENTPOSITION2|
+// LOCSOFTWARE...), fills it with real samples, but only ever calls SetVolume(-10000) on it,
+// so on modern Windows levels are silent while menu/Bink streams play. The mix already carries
+// the game's own volume settings, so that buffer is kept at 0 dB.
+// Path: LoadLibraryA("dsound") -> DirectSoundCreate(8) -> IDirectSound::CreateSoundBuffer
+// (vtable slot 3) -> IDirectSoundBuffer::SetVolume (slot 15).
+typedef HRESULT(STDMETHODCALLTYPE* SV_t)(void*, LONG);
+static SV_t o_SV = nullptr;
+static void* g_mixbuf[8]; static int g_nmix = 0;
+static bool is_mix(void* b) { for (int i = 0; i < g_nmix; ++i) if (g_mixbuf[i] == b) return true; return false; }
+static HRESULT STDMETHODCALLTYPE h_SV(void* b, LONG v) {
+    bool mix = is_mix(b);
+    static int n = 0; if (mix && v != 0 && n++ < 10) logf("mix buffer %p SetVolume %ld -> 0", b, v);
+    return o_SV(b, mix ? 0 : v);
+}
+static void vt_set(void** vt, int i, void* h, void** o) {
+    DWORD old; if (!VirtualProtect(&vt[i], 4, PAGE_EXECUTE_READWRITE, &old)) return;
+    *o = vt[i]; vt[i] = h; VirtualProtect(&vt[i], 4, old, &old);
+}
+typedef HRESULT(STDMETHODCALLTYPE* CSB_t)(void*, const void*, void**, void*);
+static CSB_t o_CSB = nullptr;
+static HRESULT STDMETHODCALLTYPE h_CSB(void* ds, const void* desc, void** pb, void* u) {
+    HRESULT r = o_CSB(ds, desc, pb, u);
+    if (r != 0 || !pb || !*pb || !desc) return r;
+    DWORD fl = ((const DWORD*)desc)[1], sz = ((const DWORD*)desc)[2];
+    if (fl & 1) return r;  // primary buffer
+    if (!o_SV) { void** vt = *(void***)*pb; vt_set(vt, 15, (void*)h_SV, (void**)&o_SV); logf("dsound buffer vtable %p hooked", vt); }
+    if (sz == 11776 && (fl & 0x40e0) == 0x40e0) {
+        g_mixbuf[g_nmix % 8] = *pb; if (g_nmix < 8) ++g_nmix; else g_mixbuf[0] = *pb;
+        logf("mix buffer %p (flags %08x)", *pb, (unsigned)fl);
+        if (o_SV) o_SV(*pb, 0);
+    }
+    return r;
+}
+static void hook_ds(void* ds) {
+    if (!ds || o_CSB) return;
+    void** vt = *(void***)ds;
+    vt_set(vt, 3, (void*)h_CSB, (void**)&o_CSB);
+    logf("dsound vtable %p: CreateSoundBuffer hooked", vt);
+}
+typedef HRESULT(WINAPI* DSC_t)(const GUID*, void**, void*);
+static DSC_t o_DSC = nullptr, o_DSC8 = nullptr;
+static HRESULT WINAPI h_DSC(const GUID* g, void** pp, void* u) {
+    HRESULT r = o_DSC(g, pp, u);
+    if (r == 0 && pp) hook_ds(*pp); return r;
+}
+static HRESULT WINAPI h_DSC8(const GUID* g, void** pp, void* u) {
+    HRESULT r = o_DSC8(g, pp, u);
+    if (r == 0 && pp) hook_ds(*pp); return r;
+}
+static void ds_hook() {
+    static int done = 0; if (done) return;
+    if (!GetModuleHandleA("dsound.dll")) return;
+    int n = hotpatch("DirectSoundCreate", (void*)h_DSC, (void**)&o_DSC, "dsound.dll") +
+            hotpatch("DirectSoundCreate8", (void*)h_DSC8, (void**)&o_DSC8, "dsound.dll");
+    logf("dsound hooks: %d", n);
+    done = 1;
+    // The game may already own its device: patch the shared vtable through a throwaway object.
+    if (!o_CSB && o_DSC8) { void* ds = nullptr; if (h_DSC8(nullptr, &ds, nullptr) == 0 && ds) ((IUnknown*)ds)->Release(); }
+}
+
+typedef HMODULE(WINAPI* LLA_t)(LPCSTR);
+static LLA_t o_LLA = nullptr;
+static HMODULE WINAPI h_LLA(LPCSTR n) {
+    HMODULE m = o_LLA(n);
+    if (n && m && strstr(n, "sound") || (n && m && strstr(n, "SOUND"))) { logf("LoadLibraryA(%s)", n); ds_hook(); }
+    return m;
+}
+static void ll_hook() {
+    int n = hotpatch("LoadLibraryA", (void*)h_LLA, (void**)&o_LLA, "kernelbase.dll");
+    logf("LoadLibraryA hook: %d", n);
+}
 static void iat_hook() {
     static int done = 0; if (done) return; done = 1;
     int n = 0;
@@ -153,7 +228,7 @@ static LRESULT CALLBACK SubProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_ACTIVATE: logf("WM_ACTIVATE %d min=%d", (int)LOWORD(w), (int)HIWORD(w)); break;
     case WM_SETFOCUS: logf("WM_SETFOCUS"); break;
     case WM_KILLFOCUS: logf("WM_KILLFOCUS"); break;
-    case WM_TIMER: if (w == 0x5b) { if (GetWindowLongA(h, GWL_EXSTYLE) & WS_EX_TOPMOST) { logf("timer: topmost set by game -> cleared"); o_SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); } return 0; } break;
+    case WM_TIMER: if (w == 0x5b) { ds_hook(); if (GetWindowLongA(h, GWL_EXSTYLE) & WS_EX_TOPMOST) { logf("timer: topmost set by game -> cleared"); o_SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); } return 0; } break;
     case WM_SYSKEYDOWN: if (w == VK_TAB) logf("WM_SYSKEYDOWN alt+tab"); break;
     case WM_SYSCOMMAND: logf("WM_SYSCOMMAND %04x", (unsigned)(w & 0xfff0)); break;
     case WM_WINDOWPOSCHANGING: {
@@ -192,8 +267,9 @@ static void fix_pp(D3DPRESENT_PARAMETERS* pp, HWND focus) {
     if (!pp) return;
     HWND h = pp->hDeviceWindow ? pp->hDeviceWindow : focus;
     g_wnd = h;
-    logf("pp windowed=%d %ux%u hz=%u fmt=%d", pp->Windowed, pp->BackBufferWidth,
-         pp->BackBufferHeight, pp->FullScreen_RefreshRateInHz, pp->BackBufferFormat);
+    logf("pp windowed=%d %ux%u hz=%u fmt=%d interval=%08x", pp->Windowed, pp->BackBufferWidth,
+         pp->BackBufferHeight, pp->FullScreen_RefreshRateInHz, pp->BackBufferFormat,
+         pp->PresentationInterval);
     if (!pp->BackBufferWidth || !pp->BackBufferHeight) {
         RECT r; GetClientRect(h, &r);
         pp->BackBufferWidth = r.right; pp->BackBufferHeight = r.bottom;
@@ -285,6 +361,7 @@ IDirect3D9* WINAPI Direct3DCreate9(UINT sdk) {
     fn f = (fn)GetProcAddress(real(), "Direct3DCreate9");
     IDirect3D9* d = f ? f(sdk) : nullptr;
     logf("Direct3DCreate9(%u) -> %p", sdk, d);
+    ds_hook();
     return d ? new D3D9W(d) : nullptr;
 }
 HRESULT WINAPI Direct3DCreate9Ex(UINT sdk, IDirect3D9Ex** out) {
@@ -310,7 +387,7 @@ FWD(PSGPSampleTexture, void, (void* a, int b, unsigned long c, unsigned long d, 
 }
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD r, LPVOID) {
-    if (r == DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(h);
+    if (r == DLL_PROCESS_ATTACH) { DisableThreadLibraryCalls(h); ds_hook(); ll_hook(); }
     else if (r == DLL_PROCESS_DETACH && g_real) FreeLibrary(g_real);
     return TRUE;
 }
