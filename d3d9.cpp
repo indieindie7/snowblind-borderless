@@ -5,6 +5,10 @@
 // every other export is forwarded to the system d3d9.dll.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
+#pragma comment(lib, "ole32.lib")
 #include <d3d9.h>
 #include <stdio.h>
 
@@ -69,8 +73,10 @@ static BOOL WINAPI h_SetForegroundWindow(HWND h) { return blocked("SetForeground
 static HWND WINAPI h_SetActiveWindow(HWND h) { return blocked("SetActiveWindow") ? h : o_SetActiveWindow(h); }
 static HWND WINAPI h_SetFocus(HWND h) { return blocked("SetFocus") ? h : o_SetFocus(h); }
 static BOOL WINAPI h_BringWindowToTop(HWND h) { return blocked("BringWindowToTop") ? TRUE : o_BringWindowToTop(h); }
-static BOOL WINAPI h_ShowWindow(HWND h, int c) { return blocked("ShowWindow") ? TRUE : o_ShowWindow(h, c); }
+// Only the game window is filtered; the proxy's own windows (FPS graph, mark editor) pass through.
+static BOOL WINAPI h_ShowWindow(HWND h, int c) { return h == g_wnd && blocked("ShowWindow") ? TRUE : o_ShowWindow(h, c); }
 static BOOL WINAPI h_SetWindowPos(HWND h, HWND a, int x, int y, int w, int hh, UINT f) {
+    if (h != g_wnd) return o_SetWindowPos(h, a, x, y, w, hh, f);
     if (blocked("SetWindowPos")) f |= SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
     if (a == HWND_TOPMOST) { logf("SetWindowPos HWND_TOPMOST -> HWND_NOTOPMOST"); a = HWND_NOTOPMOST; }
     return o_SetWindowPos(h, a, x, y, w, hh, f);
@@ -139,6 +145,7 @@ static int hotpatch(const char* name, void* hook, void** orig, const char* mod =
 // the game's own volume settings, so that buffer is kept at 0 dB.
 // Path: LoadLibraryA("dsound") -> DirectSoundCreate(8) -> IDirectSound::CreateSoundBuffer
 // (vtable slot 3) -> IDirectSoundBuffer::SetVolume (slot 15).
+static volatile LONG g_freeze = 0;  // 1 while the mark editor is open (marks.inc)
 static volatile LONG g_ff = 0;  // 1 while hold-Esc fast-forward runs (input.inc)
 typedef HRESULT(STDMETHODCALLTYPE* SV_t)(void*, LONG);
 static SV_t o_SV = nullptr;
@@ -147,11 +154,38 @@ static bool is_mix(void* b) { for (int i = 0; i < 8 && i < g_nmix; ++i) if (g_mi
 static HRESULT STDMETHODCALLTYPE h_SV(void* b, LONG v) {
     bool mix = is_mix(b);
     static int n = 0; if (mix && v != 0 && n++ < 10) logf("mix buffer %p SetVolume %ld -> 0", b, v);
-    return o_SV(b, mix ? (g_ff ? -10000 : 0) : v);
+    static int n2 = 0; if (!mix && n2++ < 40) logf("buffer %p SetVolume %ld", b, v);
+    return o_SV(b, mix ? (g_ff || g_freeze ? -10000 : 0) : v);
 }
 static void vt_set(void** vt, int i, void* h, void** o) {
     DWORD old; if (!VirtualProtect(&vt[i], 4, PAGE_EXECUTE_READWRITE, &old)) return;
     *o = vt[i]; vt[i] = h; VirtualProtect(&vt[i], 4, old, &old);
+}
+// Audio diagnostics (no level sound since 97b7f4e): Play (slot 12), Stop (18) and Lock (11) on the mix buffer.
+typedef HRESULT(STDMETHODCALLTYPE* PL_t)(void*, DWORD, DWORD, DWORD);
+typedef HRESULT(STDMETHODCALLTYPE* ST_t)(void*);
+typedef HRESULT(STDMETHODCALLTYPE* LK_t)(void*, DWORD, DWORD, void**, DWORD*, void**, DWORD*, DWORD);
+static PL_t o_PL = nullptr; static ST_t o_ST = nullptr; static LK_t o_LK = nullptr;
+static HRESULT STDMETHODCALLTYPE h_PL(void* b, DWORD r1, DWORD pr, DWORD fl) {
+    HRESULT r = o_PL(b, r1, pr, fl); static int n = 0; if (n++ < 30) logf("Play %p flags %lx%s -> %08lx", b, fl, is_mix(b) ? " (mix)" : "", r); return r;
+}
+static HRESULT STDMETHODCALLTYPE h_ST(void* b) {
+    HRESULT r = o_ST(b); static int n = 0; if (n++ < 30) logf("Stop %p%s", b, is_mix(b) ? " (mix)" : ""); return r;
+}
+typedef HRESULT(STDMETHODCALLTYPE* UL_t)(void*, void*, DWORD, void*, DWORD);
+static UL_t o_UL = nullptr;
+static HRESULT STDMETHODCALLTYPE h_UL(void* b, void* p1, DWORD n1, void* p2, DWORD n2) {
+    if (is_mix(b)) {
+        static long n = 0; static int peak = 0;
+        const short* s = (const short*)p1; for (DWORD i = 0; s && i < n1 / 2; ++i) { int v = s[i] < 0 ? -s[i] : s[i]; if (v > peak) peak = v; }
+        if ((++n % 300) == 0) { logf("mix peak %d (unlock #%ld, %lu bytes)", peak, n, n1); peak = 0; }
+    }
+    return o_UL(b, p1, n1, p2, n2);
+}
+static HRESULT STDMETHODCALLTYPE h_LK(void* b, DWORD off, DWORD by, void** p1, DWORD* n1, void** p2, DWORD* n2, DWORD fl) {
+    HRESULT r = o_LK(b, off, by, p1, n1, p2, n2, fl);
+    if (is_mix(b)) { static long n = 0; if ((n++ % 2000) == 0) logf("mix Lock #%ld off %lu bytes %lu -> %08lx", n, off, by, r); }
+    return r;
 }
 typedef HRESULT(STDMETHODCALLTYPE* CSB_t)(void*, const void*, void**, void*);
 static CSB_t o_CSB = nullptr;
@@ -160,8 +194,9 @@ static HRESULT STDMETHODCALLTYPE h_CSB(void* ds, const void* desc, void** pb, vo
     HRESULT r = o_CSB(ds, desc, pb, u);
     if (r != 0 || !pb || !*pb || !desc) return r;
     DWORD fl = ((const DWORD*)desc)[1], sz = ((const DWORD*)desc)[2];
+    static int nl = 0; if (nl++ < 60) logf("CSB %p size %lu flags %08x", *pb, (unsigned long)sz, (unsigned)fl);
     if (fl & 1) return r;  // primary buffer
-    if (!o_SV) { void** vt = *(void***)*pb; vt_set(vt, 15, (void*)h_SV, (void**)&o_SV); logf("dsound buffer vtable %p hooked", vt); }
+    if (!o_SV) { void** vt = *(void***)*pb; vt_set(vt, 15, (void*)h_SV, (void**)&o_SV); vt_set(vt, 12, (void*)h_PL, (void**)&o_PL); vt_set(vt, 18, (void*)h_ST, (void**)&o_ST); vt_set(vt, 11, (void*)h_LK, (void**)&o_LK); vt_set(vt, 19, (void*)h_UL, (void**)&o_UL); logf("dsound buffer vtable %p hooked", vt); }
     if (sz == 11776 && (fl & 0x40e0) == 0x40e0) {
         g_mixbuf[g_nmix % 8] = *pb; ++g_nmix;  // newest = g_mixbuf[(g_nmix - 1) % 8]
         logf("mix buffer %p (flags %08x)", *pb, (unsigned)fl);
@@ -215,7 +250,9 @@ static void iat_hook() {
 }
 
 static WNDPROC g_oldproc = nullptr;
+static bool mark_drop(HDROP d);
 static LRESULT CALLBACK SubProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_DROPFILES) { HDROP d = (HDROP)w; mark_drop(d); DragFinish(d); return 0; }
     // The game crashes (c0000005 at Snowblind.exe+0xa36f65) when it is told it lost focus,
     // so in borderless mode it never hears about activation changes at all: it keeps
     // running in the background and never pauses or minimizes.
@@ -245,6 +282,7 @@ static LRESULT CALLBACK SubProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return CallWindowProcA(g_oldproc, h, m, w, l);
 }
 #include "marks.inc"
+#include "fps.inc"
 #include "input.inc"
 static void subclass(HWND h) {
     if (g_oldproc || !h) return;
@@ -252,6 +290,7 @@ static void subclass(HWND h) {
     SetTimer(h, 0x5b, 500, nullptr);
     mark_start(h);
     input_start();
+    fps_start();
     logf("subclassed %p (old proc %p)", h, g_oldproc);
 }
 

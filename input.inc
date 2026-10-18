@@ -23,7 +23,7 @@ static CRITICAL_SECTION g_clk; static int g_clk_init = 0;
 struct Clk { double scale; long long real0, fake0; };
 static Clk g_qpc = {1, 0, 0}, g_tick = {1, 0, 0}, g_tgt = {1, 0, 0};
 static long long clk_map(Clk& c, long long real) {
-    double s = g_ff ? FF_SCALE : 1.0;
+    double s = g_freeze ? 0.0 : g_ff ? FF_SCALE : 1.0;  // frozen while a mark is written
     EnterCriticalSection(&g_clk);
     if (c.real0 == 0) { c.real0 = real; c.fake0 = real; c.scale = s; }
     if (s != c.scale) { c.fake0 = c.fake0 + (long long)((real - c.real0) * c.scale); c.real0 = real; c.scale = s; }
@@ -57,6 +57,7 @@ typedef HRESULT(STDMETHODCALLTYPE* GDD_t)(void*, DWORD, DIDEVICEOBJECTDATA*, DWO
 static GDS_t o_GDS_A = nullptr, o_GDS_W = nullptr; static GDD_t o_GDD_A = nullptr, o_GDD_W = nullptr;
 static HRESULT gds(GDS_t o, void* d, DWORD n, void* p) {
     HRESULT r = o(d, n, p);
+    if (n == 256) fps_tick();  // one keyboard poll per game frame (fps.inc)
     if (FAILED(r) || !p) return r;
     if (!game_focused()) { memset(p, 0, n); return r; }
     if (n == 256) {  // keyboard
