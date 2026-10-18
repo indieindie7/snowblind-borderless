@@ -52,6 +52,12 @@ The game sets its window topmost (WS_EX_TOPMOST) on its own after the device is 
 
 Do not add d3d9 vtable hooks beyond Reset (slot 16): Steam's overlay (`gameoverlayrenderer.dll`) hooks Present/EndScene/swapchain Present too, and both patching the same slots crashes the game a few seconds after a Steam launch (c0000005 in Snowblind.exe). Direct launches of the exe (no overlay) hide that bug. DirectInput is already opened non-exclusive by the game, so a dinput8 proxy is not needed (`dinput8.cpp` is kept only as a diagnostic).
 
+## Extras (since 2026-10-18)
+
+- **Fast-forward cinematics:** in an in-engine cinematic (you can look around but not move), hold Esc to run the game clock 8x. The level audio is muted while you hold it, so speech doesn't drift out of sync. A short tap still opens the pause menu. Outside cinematics Esc works as normal. The proxy reads the game's own flag for this: byte +0x1d of the object at `*0x1023308` in Snowblind.SP, which is set at 0x49bbc0 and cleared at 0x49bc60.
+- **Keeps running unfocused:** the game no longer pauses when you alt-tab. Keyboard and mouse input is ignored while another window has focus.
+- **Playtest marks:** create a `marks` folder in the game folder to turn this on. F9 saves a screenshot to `marks/NNN.png` and opens a note box (Enter saves, Esc cancels). Notes go to `marks/marks.jsonl`, in the same format as [playtest-marks](https://github.com/indieindie7/playtest-marks).
+
 ## Widescreen (community Widescreen Patch 1.0 by Felix Krull, MIT)
 
 The patch is itself a `d3d9.dll` wrapper (source: bitbucket.org/fk/snowblind-widescreen-fix,
