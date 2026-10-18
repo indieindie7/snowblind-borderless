@@ -56,7 +56,10 @@ Do not add d3d9 vtable hooks beyond Reset (slot 16): Steam's overlay (`gameoverl
 
 - **Fast-forward cinematics:** in an in-engine cinematic (you can look around but not move), hold Esc to run the game clock 8x. The level audio is muted while you hold it, so speech doesn't drift out of sync. A short tap still opens the pause menu. Outside cinematics Esc works as normal. The proxy reads the game's own flag for this: byte +0x1d of the object at `*0x1023308` in Snowblind.SP, which is set at 0x49bbc0 and cleared at 0x49bc60.
 - **Keeps running unfocused:** the game no longer pauses when you alt-tab. Keyboard and mouse input is ignored while another window has focus.
-- **Playtest marks:** create a `marks` folder in the game folder to turn this on. F9 saves a screenshot to `marks/NNN.png` and opens a note box (Enter saves, Esc cancels). Notes go to `marks/marks.jsonl`, in the same format as [playtest-marks](https://github.com/indieindie7/playtest-marks).
+- **Playtest marks:** create a `marks` folder in the game folder to turn this on. F9 saves a screenshot to `marks/NNN.png` and opens a note box (Enter saves, Esc cancels). Notes go to `marks/marks.jsonl`, in the same format as [playtest-marks](https://github.com/indieindie7/playtest-marks). The editor has pen, arrow, text and Pick tools: Pick shows the names of the objects under the cursor (from the game's string table), and the mark records the picked objects, the camera (position, angles) and nearby objects.
+- **Level sound:** if levels are silent while the menu has sound, Windows may have stored a mute for `Snowblind.SP` in the volume mixer. The proxy un-mutes its own audio session while the game runs (log: "audio session was muted in the Windows mixer -> un-muted"). Create a file `keep-mute` in the game folder to turn this off.
+- **No aiming reticle:** the reticle is removed. Create a file `show-reticle` in the game folder to keep it.
+- **FPS graph:** the last 240 frame times are drawn in the top-left corner, with the current, average and worst frame rate. F10 toggles it.
 
 ## Widescreen (community Widescreen Patch 1.0 by Felix Krull, MIT)
 
