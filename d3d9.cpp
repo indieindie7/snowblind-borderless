@@ -139,14 +139,15 @@ static int hotpatch(const char* name, void* hook, void** orig, const char* mod =
 // the game's own volume settings, so that buffer is kept at 0 dB.
 // Path: LoadLibraryA("dsound") -> DirectSoundCreate(8) -> IDirectSound::CreateSoundBuffer
 // (vtable slot 3) -> IDirectSoundBuffer::SetVolume (slot 15).
+static volatile LONG g_ff = 0;  // 1 while hold-Esc fast-forward runs (input.inc)
 typedef HRESULT(STDMETHODCALLTYPE* SV_t)(void*, LONG);
 static SV_t o_SV = nullptr;
 static void* g_mixbuf[8]; static int g_nmix = 0;
-static bool is_mix(void* b) { for (int i = 0; i < g_nmix; ++i) if (g_mixbuf[i] == b) return true; return false; }
+static bool is_mix(void* b) { for (int i = 0; i < 8 && i < g_nmix; ++i) if (g_mixbuf[i] == b) return true; return false; }
 static HRESULT STDMETHODCALLTYPE h_SV(void* b, LONG v) {
     bool mix = is_mix(b);
     static int n = 0; if (mix && v != 0 && n++ < 10) logf("mix buffer %p SetVolume %ld -> 0", b, v);
-    return o_SV(b, mix ? 0 : v);
+    return o_SV(b, mix ? (g_ff ? -10000 : 0) : v);
 }
 static void vt_set(void** vt, int i, void* h, void** o) {
     DWORD old; if (!VirtualProtect(&vt[i], 4, PAGE_EXECUTE_READWRITE, &old)) return;
@@ -155,13 +156,14 @@ static void vt_set(void** vt, int i, void* h, void** o) {
 typedef HRESULT(STDMETHODCALLTYPE* CSB_t)(void*, const void*, void**, void*);
 static CSB_t o_CSB = nullptr;
 static HRESULT STDMETHODCALLTYPE h_CSB(void* ds, const void* desc, void** pb, void* u) {
+    // (Rewriting secondary buffers to GLOBALFOCUS crashed DSOAL in levels; OpenAL keeps playing unfocused anyway.)
     HRESULT r = o_CSB(ds, desc, pb, u);
     if (r != 0 || !pb || !*pb || !desc) return r;
     DWORD fl = ((const DWORD*)desc)[1], sz = ((const DWORD*)desc)[2];
     if (fl & 1) return r;  // primary buffer
     if (!o_SV) { void** vt = *(void***)*pb; vt_set(vt, 15, (void*)h_SV, (void**)&o_SV); logf("dsound buffer vtable %p hooked", vt); }
     if (sz == 11776 && (fl & 0x40e0) == 0x40e0) {
-        g_mixbuf[g_nmix % 8] = *pb; if (g_nmix < 8) ++g_nmix; else g_mixbuf[0] = *pb;
+        g_mixbuf[g_nmix % 8] = *pb; ++g_nmix;  // newest = g_mixbuf[(g_nmix - 1) % 8]
         logf("mix buffer %p (flags %08x)", *pb, (unsigned)fl);
         if (o_SV) o_SV(*pb, 0);
     }
@@ -224,8 +226,9 @@ static LRESULT CALLBACK SubProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         logf("WM_ACTIVATEAPP %d other-thread=%u fg=%p '%s' \"%s\" our style=%08x ex=%08x (hidden)", (int)w, (unsigned)l, fg, cls, ttl,
              (unsigned)GetWindowLongA(h, GWL_STYLE), (unsigned)GetWindowLongA(h, GWL_EXSTYLE));
         if (w) trace("activateapp");
+        if (!w) return 0;  // keep running in the background: the game pauses on deactivation
         break; }
-    case WM_ACTIVATE: logf("WM_ACTIVATE %d min=%d", (int)LOWORD(w), (int)HIWORD(w)); break;
+    case WM_ACTIVATE: logf("WM_ACTIVATE %d min=%d", (int)LOWORD(w), (int)HIWORD(w)); if (LOWORD(w) == WA_INACTIVE) return 0; break;
     case WM_SETFOCUS: logf("WM_SETFOCUS"); break;
     case WM_KILLFOCUS: logf("WM_KILLFOCUS"); break;
     case WM_TIMER: if (w == 0x5b) { ds_hook(); if (GetWindowLongA(h, GWL_EXSTYLE) & WS_EX_TOPMOST) { logf("timer: topmost set by game -> cleared"); o_SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); } return 0; } break;
@@ -241,10 +244,14 @@ static LRESULT CALLBACK SubProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     return CallWindowProcA(g_oldproc, h, m, w, l);
 }
+#include "marks.inc"
+#include "input.inc"
 static void subclass(HWND h) {
     if (g_oldproc || !h) return;
     g_oldproc = (WNDPROC)SetWindowLongPtrA(h, GWLP_WNDPROC, (LONG_PTR)SubProc);
     SetTimer(h, 0x5b, 500, nullptr);
+    mark_start(h);
+    input_start();
     logf("subclassed %p (old proc %p)", h, g_oldproc);
 }
 
